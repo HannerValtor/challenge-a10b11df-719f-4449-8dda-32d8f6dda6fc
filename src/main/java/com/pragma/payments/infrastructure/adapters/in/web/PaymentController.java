@@ -112,7 +112,7 @@ public class PaymentController {
                 .defaultIfEmpty(ResponseEntity.notFound().build());
     }
 
-    @HeadMapping("/exists/{operationNumber}/{channel}")
+    @RequestMapping(method = RequestMethod.HEAD, value = "/exists/{operationNumber}/{channel}")
     @Operation(summary = "Verificar existencia de transacción",
             description = "Verifica rápidamente si una transacción fue procesada")
     @ApiResponses(value = {
@@ -134,7 +134,7 @@ public class PaymentController {
     private PaymentResponse toResponse(Transaction transaction) {
         return PaymentResponse.builder()
                 .transactionId(transaction.getId())
-                .status(transaction.getStatus().name())
+                .status(transaction.getStatus())
                 .amount(transaction.getAmount())
                 .currency(transaction.getCurrency())
                 .processedAt(transaction.getProcessedAt())

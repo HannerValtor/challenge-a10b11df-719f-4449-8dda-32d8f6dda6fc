@@ -1,7 +1,6 @@
 package com.pragma.payments.infrastructure.config;
 
 
-import com.pragma.payments.infrastructure.adapters.in.web.Builder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -68,8 +67,7 @@ public class WebClientConfig {
     }
 
     @Bean
-    public org.springframework.boot.web.reactive.function.client.WebClient.Builder 
-            webClientBuilder(WebClient webClient) {
+    public WebClient.Builder webClientBuilder(WebClient webClient) {
         return webClient.mutate();
     }
 }

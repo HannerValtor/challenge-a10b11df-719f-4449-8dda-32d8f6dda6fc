@@ -5,6 +5,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
+import java.time.LocalDateTime;
 import java.util.Objects;
 import java.util.regex.Pattern;
 
@@ -70,7 +71,11 @@ public class IdempotencyKey {
     public void validateNotDuplicate(IdempotencyKey existingKey) {
         if (existingKey != null && this.equals(existingKey)) {
             throw new TransactionAlreadyProcessedException(
-                "Ya existe una transacción procesada con la clave de idempotencia: " + this.toString()
+                this.toUniqueString(),
+                this.channel,
+                null,
+                null,
+                this.operationNumber
             );
         }
     }

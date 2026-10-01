@@ -11,9 +11,9 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
-import reactor.util.retry.RetryBackoffSpec;
 
 import java.time.Duration;
+import java.util.concurrent.TimeoutException;
 
 @Component
 public class RiskBureauAdapter implements RiskBureauPort {

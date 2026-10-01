@@ -3,8 +3,6 @@ package com.pragma.payments.application.ports.in;
 import com.pragma.payments.domain.model.IdempotencyKey;
 import com.pragma.payments.domain.model.Transaction;
 import reactor.core.publisher.Mono;
-import java.math.BigDecimal;
-import java.util.UUID;
 
 /**
  * Puerto de entrada para el procesamiento de pagos.
@@ -14,25 +12,11 @@ import java.util.UUID;
 public interface PaymentServicePort {
     /**
      * Procesa una solicitud de pago con idempotencia garantizada.
-     * 
-     * @param transactionId Identificador único de la transacción generado por el cliente.
-     * @param operationNumber Número de operación proporcionado por el canal.
-     * @param channel Canal desde el cual se origina la solicitud (ej: "WEB", "MOBILE", "API").
-     * @param amount Monto de la transacción.
-     * @param currency Moneda de la transacción (ej: "COP", "USD").
-     * @param accountId Identificador de la cuenta origen.
-     * @param merchantId Identificador del comercio.
+     *
+     * @param transactionMono Mono con la transacción a procesar.
      * @return Mono<Transaction> que emite la transacción procesada o error en caso de fallo.
      */
-    Mono<Transaction> processPayment(
-        UUID transactionId,
-        String operationNumber,
-        String channel,
-        BigDecimal amount,
-        String currency,
-        String accountId,
-        String merchantId
-    );
+    Mono<Transaction> processPayment(Mono<Transaction> transactionMono);
 
     /**
      * Verifica si una transacción ya fue procesada con la misma clave de idempotencia.

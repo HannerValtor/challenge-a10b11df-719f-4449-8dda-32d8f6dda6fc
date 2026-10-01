@@ -1,14 +1,13 @@
 package com.pragma.payments.application.usecases;
 
-
-import com.pragma.payments.domain.model.TransactionStatus;
 import com.pragma.payments.application.ports.in.PaymentServicePort;
 import com.pragma.payments.application.ports.out.FraudDetectionPort;
 import com.pragma.payments.application.ports.out.RiskBureauPort;
-import com.pragma.payments.domain.exception.TransactionAlreadyProcessedException;
 import com.pragma.payments.domain.exception.ExternalServiceTimeoutException;
+import com.pragma.payments.domain.exception.TransactionAlreadyProcessedException;
 import com.pragma.payments.domain.model.IdempotencyKey;
 import com.pragma.payments.domain.model.Transaction;
+import com.pragma.payments.infrastructure.adapters.out.core.CoreBankingAdapter;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
 import org.slf4j.Logger;
@@ -17,11 +16,10 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.UUID;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 public class PaymentUseCase implements PaymentServicePort {
@@ -29,22 +27,26 @@ public class PaymentUseCase implements PaymentServicePort {
     private static final Logger log = LoggerFactory.getLogger(PaymentUseCase.class);
     private static final Duration EXTERNAL_SERVICE_TIMEOUT = Duration.ofSeconds(3);
     private static final int MAX_RETRY_ATTEMPTS = 3;
+    private static final int HIGH_RISK_THRESHOLD = 70;
 
     private final FraudDetectionPort fraudDetectionPort;
     private final RiskBureauPort riskBureauPort;
-    private final java.util.Map<String, Transaction> transactionCache;
+    private final CoreBankingAdapter coreBankingAdapter;
+    private final Map<String, Transaction> transactionCache;
 
     public PaymentUseCase(
             FraudDetectionPort fraudDetectionPort,
-            RiskBureauPort riskBureauPort) {
+            RiskBureauPort riskBureauPort,
+            CoreBankingAdapter coreBankingAdapter) {
         this.fraudDetectionPort = fraudDetectionPort;
         this.riskBureauPort = riskBureauPort;
-        this.transactionCache = new java.util.concurrent.ConcurrentHashMap<>();
+        this.coreBankingAdapter = coreBankingAdapter;
+        this.transactionCache = new ConcurrentHashMap<>();
     }
 
     @Override
     @CircuitBreaker(name = "paymentCircuitBreaker", fallbackMethod = "processPaymentFallback")
-    @Retry(name = "paymentRetry", maxAttempts = MAX_RETRY_ATTEMPTS)
+    @Retry(name = "paymentRetry")
     public Mono<Transaction> processPayment(Mono<Transaction> transactionMono) {
         return transactionMono
                 .flatMap(this::validateIdempotency)
@@ -80,11 +82,16 @@ public class PaymentUseCase implements PaymentServicePort {
                 .flatMap(existing -> {
                     if (existing != null) {
                         log.warn("Transacción duplicada detectada para clave: {}", cacheKey);
-                        return Mono.error(new TransactionAlreadyProcessedException(
-                                "Transacción ya procesada para la clave de idempotencia: " + key.getOperationNumber()));
+                        return Mono.<Transaction>error(new TransactionAlreadyProcessedException(
+                                cacheKey,
+                                key != null ? key.getChannel() : "unknown",
+                                transaction.getId(),
+                                Instant.now(),
+                                key != null ? key.getOperationNumber() : "unknown"));
                     }
                     return Mono.just(transaction);
-                });
+                })
+                .switchIfEmpty(Mono.just(transaction));
     }
 
     @CircuitBreaker(name = "fraudDetectionCircuitBreaker", fallbackMethod = "fraudDetectionFallback")
@@ -106,13 +113,14 @@ public class PaymentUseCase implements PaymentServicePort {
                     log.error("Error en detección de fraude para transacción {}: {}",
                             transaction.getId(), e.getMessage());
                     return Mono.error(new ExternalServiceTimeoutException(
-                            "Timeout en servicio de detección de fraude"));
+                            "FRAUD_DETECTION", "/evaluate",
+                            EXTERNAL_SERVICE_TIMEOUT, EXTERNAL_SERVICE_TIMEOUT));
                 });
     }
 
     @CircuitBreaker(name = "riskBureauCircuitBreaker", fallbackMethod = "riskEvaluationFallback")
     private Mono<Transaction> executeRiskEvaluation(Transaction transaction) {
-        if (transaction.getStatus() == Transaction.TransactionStatus.REJECTED) {
+        if (Transaction.TransactionStatus.REJECTED.name().equals(transaction.getStatus())) {
             return Mono.just(transaction);
         }
 
@@ -123,7 +131,7 @@ public class PaymentUseCase implements PaymentServicePort {
                     transaction.setRiskScore(score);
                     log.info("Puntuación de riesgo para transacción {}: {}", transaction.getId(), score);
 
-                    if (score >= 70) {
+                    if (score >= HIGH_RISK_THRESHOLD) {
                         transaction.setStatus(Transaction.TransactionStatus.REJECTED);
                         transaction.setFailureReason("Riesgo alto detectado: puntuación " + score);
                         log.warn("Transacción {} rechazada por riesgo alto: {}", transaction.getId(), score);
@@ -134,14 +142,15 @@ public class PaymentUseCase implements PaymentServicePort {
                     log.error("Error en evaluación de riesgo para transacción {}: {}",
                             transaction.getId(), e.getMessage());
                     return Mono.error(new ExternalServiceTimeoutException(
-                            "Timeout en servicio de buró de riesgos"));
+                            "RISK_BUREAU", "/score",
+                            EXTERNAL_SERVICE_TIMEOUT, EXTERNAL_SERVICE_TIMEOUT));
                 });
     }
 
     private Mono<Transaction> finalizeTransaction(Transaction transaction) {
         return Mono.fromCallable(() -> {
-            if (transaction.getStatus() != Transaction.TransactionStatus.REJECTED) {
-                transaction.setStatus(Transaction.TransactionStatus.APPROVED);
+            if (!Transaction.TransactionStatus.REJECTED.name().equals(transaction.getStatus())) {
+                transaction.setStatus(Transaction.TransactionStatus.COMPLETED);
             }
             transaction.setProcessedAt(Instant.now());
 
@@ -155,16 +164,20 @@ public class PaymentUseCase implements PaymentServicePort {
     }
 
     private String buildCacheKey(IdempotencyKey key) {
+        if (key == null) {
+            return "unknown";
+        }
         return key.getOperationNumber() + "_" + key.getChannel();
     }
 
-    private Mono<Transaction> processPaymentFallback(Transaction transaction, Throwable t) {
-        log.error("Circuit breaker activado para transacción {}. Fallback ejecutado. Error: {}",
-                transaction.getId(), t.getMessage());
-
-        transaction.setStatus(Transaction.TransactionStatus.PENDING);
-        transaction.setFailureReason("Servicio temporalmente no disponible. Por favor intente más tarde.");
-        return Mono.just(transaction);
+    private Mono<Transaction> processPaymentFallback(Mono<Transaction> transactionMono, Throwable t) {
+        log.error("Circuit breaker activado para processPayment. Fallback ejecutado. Error: {}",
+                t.getMessage());
+        return transactionMono.map(transaction -> {
+            transaction.setStatus(Transaction.TransactionStatus.PENDING);
+            transaction.setFailureReason("Servicio temporalmente no disponible. Por favor intente más tarde.");
+            return transaction;
+        });
     }
 
     private Mono<Transaction> fraudDetectionFallback(Transaction transaction, Throwable t) {
