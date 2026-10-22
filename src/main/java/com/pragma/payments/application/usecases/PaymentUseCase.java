@@ -48,12 +48,34 @@ public class PaymentUseCase implements PaymentServicePort {
     @CircuitBreaker(name = "paymentCircuitBreaker", fallbackMethod = "processPaymentFallback")
     @Retry(name = "paymentRetry")
     public Mono<Transaction> processPayment(Mono<Transaction> transactionMono) {
-        return transactionMono
-                .flatMap(this::validateIdempotency)
-                .flatMap(this::executeFraudDetection)
-                .flatMap(this::executeRiskEvaluation)
-                .flatMap(this::finalizeTransaction)
+        return transactionMono.flatMap(transaction ->
+                validateIdempotency(transaction)
+                        .flatMap(this::executeFraudDetection)
+                        .flatMap(this::executeRiskEvaluation)
+                        .flatMap(this::finalizeTransaction)
+                        // Si el procesamiento falla por un fallo transitorio (NO por duplicado),
+                        // se libera la reserva de idempotencia para permitir un reintento posterior
+                        // (Requirement 5.1/5.3). Un duplicado conserva la reserva previa (Req 3.2).
+                        .onErrorResume(error -> {
+                            if (!(error instanceof TransactionAlreadyProcessedException)) {
+                                releaseReservation(transaction);
+                            }
+                            return Mono.error(error);
+                        }))
                 .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
+     * Libera la reserva de idempotencia de una transacción cuyo procesamiento falló por un
+     * fallo transitorio, de modo que un reintento posterior con la misma clave pueda proceder.
+     * Solo elimina la entrada si sigue siendo la misma transacción reservada (borrado condicional).
+     */
+    private void releaseReservation(Transaction transaction) {
+        String cacheKey = buildCacheKey(transaction.getIdempotencyKey());
+        boolean removed = transactionCache.remove(cacheKey, transaction);
+        if (removed) {
+            log.debug("Reserva de idempotencia liberada tras fallo transitorio para clave: {}", cacheKey);
+        }
     }
 
     @Override
@@ -73,25 +95,38 @@ public class PaymentUseCase implements PaymentServicePort {
                         : Mono.empty());
     }
 
+    /**
+     * Reserva atómica de la clave de idempotencia (Requirements 3.1, 3.4, 4.3).
+     *
+     * <p>Sustituye el patrón TOCTOU {@code get} + {@code switchIfEmpty} + {@code put} (que tenía
+     * una ventana de carrera entre el check y el act) por una ÚNICA operación atómica
+     * {@code putIfAbsent} sobre el {@link java.util.concurrent.ConcurrentHashMap}. Esto garantiza
+     * que, ante K solicitudes concurrentes con la misma clave, exactamente una gane la reserva
+     * ({@code putIfAbsent == null}) y las K-1 restantes se rechacen como duplicadas.</p>
+     *
+     * <p>La reserva se hace con la propia transacción en estado {@code PENDING} como marcador;
+     * {@link #finalizeTransaction} actualiza luego el valor a {@code COMPLETED}/{@code REJECTED}.
+     * El acceso se ejecuta en el Bounded_Scheduler, nunca en el event-loop (Requirement 3.5).</p>
+     */
     private Mono<Transaction> validateIdempotency(Transaction transaction) {
         IdempotencyKey key = transaction.getIdempotencyKey();
         String cacheKey = buildCacheKey(key);
 
-        return Mono.fromCallable(() -> transactionCache.get(cacheKey))
-                .subscribeOn(Schedulers.boundedElastic())
-                .flatMap(existing -> {
-                    if (existing != null) {
+        return Mono.fromCallable(() -> {
+                    // putIfAbsent es atómico: solo uno de los hilos concurrentes obtiene null.
+                    Transaction previous = transactionCache.putIfAbsent(cacheKey, transaction);
+                    if (previous != null) {
                         log.warn("Transacción duplicada detectada para clave: {}", cacheKey);
-                        return Mono.<Transaction>error(new TransactionAlreadyProcessedException(
+                        throw new TransactionAlreadyProcessedException(
                                 cacheKey,
                                 key != null ? key.getChannel() : "unknown",
-                                transaction.getId(),
-                                Instant.now(),
-                                key != null ? key.getOperationNumber() : "unknown"));
+                                previous.getId(),
+                                previous.getProcessedAt(),
+                                key != null ? key.getOperationNumber() : "unknown");
                     }
-                    return Mono.just(transaction);
+                    return transaction;
                 })
-                .switchIfEmpty(Mono.just(transaction));
+                .subscribeOn(Schedulers.boundedElastic());
     }
 
     @CircuitBreaker(name = "fraudDetectionCircuitBreaker", fallbackMethod = "fraudDetectionFallback")
@@ -148,14 +183,37 @@ public class PaymentUseCase implements PaymentServicePort {
     }
 
     private Mono<Transaction> finalizeTransaction(Transaction transaction) {
-        return Mono.fromCallable(() -> {
-            if (!Transaction.TransactionStatus.REJECTED.name().equals(transaction.getStatus())) {
-                transaction.setStatus(Transaction.TransactionStatus.COMPLETED);
-            }
-            transaction.setProcessedAt(Instant.now());
+        // Si ya fue rechazada (fraude o riesgo alto), no se envía al core bancario.
+        if (Transaction.TransactionStatus.REJECTED.name().equals(transaction.getStatus())) {
+            return persistFinalState(transaction);
+        }
 
+        // Envío al core bancario como paso final de la cadena de servicios externos.
+        // El timeout de 2000 ms y el bulkhead viven en el propio CoreBankingAdapter (Req 5.1, 5.3).
+        return coreBankingAdapter.processTransaction(transaction)
+                .timeout(EXTERNAL_SERVICE_TIMEOUT)
+                .flatMap(coreResult -> {
+                    transaction.setExternalReference(coreResult);
+                    transaction.setStatus(Transaction.TransactionStatus.COMPLETED);
+                    return persistFinalState(transaction);
+                })
+                .onErrorResume(Exception.class, e -> {
+                    log.error("Error del core bancario para transacción {}: {}",
+                            transaction.getId(), e.getMessage());
+                    return Mono.error(new ExternalServiceTimeoutException(
+                            "CORE_BANKING", "/process",
+                            EXTERNAL_SERVICE_TIMEOUT, EXTERNAL_SERVICE_TIMEOUT));
+                });
+    }
+
+    private Mono<Transaction> persistFinalState(Transaction transaction) {
+        return Mono.fromCallable(() -> {
+            transaction.setProcessedAt(Instant.now());
+            // La clave ya fue reservada atómicamente en validateIdempotency; aquí solo se
+            // actualiza el valor con el estado final (COMPLETED/REJECTED). Se usa replace para
+            // no re-crear la entrada si otro flujo la hubiese eliminado (Requirement 3.1).
             String cacheKey = buildCacheKey(transaction.getIdempotencyKey());
-            transactionCache.put(cacheKey, transaction);
+            transactionCache.replace(cacheKey, transaction);
 
             log.info("Transacción {} finalizada con estado: {}",
                     transaction.getId(), transaction.getStatus());

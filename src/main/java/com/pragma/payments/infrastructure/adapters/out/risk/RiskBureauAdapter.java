@@ -2,7 +2,10 @@ package com.pragma.payments.infrastructure.adapters.out.risk;
 
 import com.pragma.payments.application.ports.out.RiskBureauPort;
 import com.pragma.payments.domain.model.Transaction;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.reactor.bulkhead.operator.BulkheadOperator;
 import io.github.resilience4j.retry.annotation.Retry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,21 +22,24 @@ import java.util.concurrent.TimeoutException;
 public class RiskBureauAdapter implements RiskBureauPort {
 
     private static final Logger log = LoggerFactory.getLogger(RiskBureauAdapter.class);
-    private static final int DEFAULT_TIMEOUT_SECONDS = 3;
-    private static final int DEFAULT_RETRY_ATTEMPTS = 3;
-    private static final long DEFAULT_BACKOFF_MS = 1000L;
+    // Timeout alineado a 2000 ms: el buró de riesgos no debe retener la llamada más de 2s
+    // (Requirement 5.1). Supera ese umbral ⇒ timeout + liberación del permiso del bulkhead.
+    private static final int DEFAULT_TIMEOUT_SECONDS = 2;
 
     private final WebClient webClient;
     private final String baseUrl;
     private final int timeoutSeconds;
+    private final Bulkhead bulkhead;
 
     public RiskBureauAdapter(
             WebClient webClient,
+            BulkheadRegistry bulkheadRegistry,
             @Value("${external.services.risk-bureau.url:http://localhost:8083}") String baseUrl,
-            @Value("${external.services.risk-bureau.timeout-seconds:3}") int timeoutSeconds) {
+            @Value("${external.services.risk-bureau.timeout-seconds:2}") int timeoutSeconds) {
         this.webClient = webClient;
         this.baseUrl = baseUrl;
         this.timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_TIMEOUT_SECONDS;
+        this.bulkhead = bulkheadRegistry.bulkhead("riskBureauService");
     }
 
     @Override
@@ -50,6 +56,7 @@ public class RiskBureauAdapter implements RiskBureauPort {
                 .retrieve()
                 .bodyToMono(RiskScoreResponse.class)
                 .timeout(Duration.ofSeconds(timeoutSeconds))
+                .transformDeferred(BulkheadOperator.of(bulkhead))
                 .map(RiskScoreResponse::getScore)
                 .doOnSuccess(score -> log.info("Risk score obtenido: {} para cuenta: {}", 
                         score, transaction.getAccountId()))
@@ -73,6 +80,7 @@ public class RiskBureauAdapter implements RiskBureauPort {
                 .retrieve()
                 .bodyToMono(BlacklistResponse.class)
                 .timeout(Duration.ofSeconds(timeoutSeconds))
+                .transformDeferred(BulkheadOperator.of(bulkhead))
                 .map(BlacklistResponse::isBlacklisted)
                 .doOnSuccess(result -> log.info("Cuenta {} en blacklist: {}", accountId, result))
                 .doOnError(WebClientResponseException.class, e -> 

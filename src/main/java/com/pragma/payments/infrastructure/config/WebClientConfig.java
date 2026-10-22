@@ -21,6 +21,8 @@ public class WebClientConfig {
     private static final int DEFAULT_CONNECTION_TIMEOUT_MS = 5000;
     private static final int DEFAULT_RESPONSE_TIMEOUT_MS = 10000;
     private static final int DEFAULT_POOL_MAX_CONNECTIONS = 100;
+    /** Tamaño máximo FINITO de la cola de adquisición de conexiones (Requirement 2.6). */
+    static final int PENDING_ACQUIRE_MAX_COUNT = DEFAULT_POOL_MAX_CONNECTIONS * 2;
 
     @Value("${external.services.connection-timeout-ms:5000}")
     private int connectionTimeoutMs;
@@ -58,8 +60,12 @@ public class WebClientConfig {
     public ConnectionProvider connectionProvider() {
         return ConnectionProvider.builder("external-services-pool")
                 .maxConnections(maxConnections > 0 ? maxConnections : DEFAULT_POOL_MAX_CONNECTIONS)
-                .pendingAcquireTimeout(Duration.ofMillis(10000))
-                .pendingAcquireMaxCount(-1)
+                // Cola de adquisición ACOTADA: evita encolar peticiones de forma ilimitada
+                // cuando el pool de 100 conexiones está agotado. Al desbordar la cola o agotar
+                // el timeout, se propaga un error de agotamiento sin bloquear indefinidamente
+                // el hilo invocante (Requirements 2.5, 2.6).
+                .pendingAcquireTimeout(Duration.ofMillis(5000))
+                .pendingAcquireMaxCount(PENDING_ACQUIRE_MAX_COUNT)
                 .maxIdleTime(Duration.ofSeconds(30))
                 .maxLifeTime(Duration.ofMinutes(5))
                 .evictInBackground(Duration.ofSeconds(30))

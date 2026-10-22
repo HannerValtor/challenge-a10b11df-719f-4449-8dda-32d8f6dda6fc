@@ -3,7 +3,10 @@ package com.pragma.payments.infrastructure.adapters.out.core;
 import com.pragma.payments.application.ports.out.CoreBankingPort;
 import com.pragma.payments.domain.exception.ExternalServiceTimeoutException;
 import com.pragma.payments.domain.model.Transaction;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import io.github.resilience4j.reactor.bulkhead.operator.BulkheadOperator;
 import io.github.resilience4j.retry.annotation.Retry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,21 +25,28 @@ public class CoreBankingAdapter implements CoreBankingPort {
     private static final Logger log = LoggerFactory.getLogger(CoreBankingAdapter.class);
     private static final String CIRCUIT_BREAKER_NAME = "coreBankingCircuitBreaker";
     private static final String RETRY_NAME = "coreBankingRetry";
-    private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(5);
+    // Timeout alineado a 2000 ms (Requirement 5.1).
+    private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(2);
 
     private final WebClient webClient;
     private final String baseUrl;
+    private final Bulkhead bulkhead;
 
     public CoreBankingAdapter(
             WebClient webClient,
+            BulkheadRegistry bulkheadRegistry,
             @Value("${app.services.core-banking.base-url:http://localhost:8081}") String baseUrl) {
         this.webClient = webClient;
         this.baseUrl = baseUrl;
+        this.bulkhead = bulkheadRegistry.bulkhead("coreBankingService");
         log.info("CoreBankingAdapter initialized with baseUrl: {}", baseUrl);
     }
 
+    /** Constructor de conveniencia para pruebas unitarias (sin contexto Spring). */
     public CoreBankingAdapter(String baseUrl) {
-        this(WebClient.builder().build(), baseUrl);
+        this.webClient = WebClient.builder().build();
+        this.baseUrl = baseUrl;
+        this.bulkhead = BulkheadRegistry.ofDefaults().bulkhead("coreBankingService");
     }
 
     @CircuitBreaker(name = CIRCUIT_BREAKER_NAME, fallbackMethod = "processTransactionFallback")
@@ -54,6 +64,7 @@ public class CoreBankingAdapter implements CoreBankingPort {
                 .bodyToMono(String.class)
                 .timeout(DEFAULT_TIMEOUT, Mono.error(new ExternalServiceTimeoutException(
                         "CORE_BANKING", "/process", DEFAULT_TIMEOUT, DEFAULT_TIMEOUT)))
+                .transformDeferred(BulkheadOperator.of(bulkhead))
                 .doOnSuccess(response -> log.info("Transacción {} procesada por el core: {}",
                         transaction.getId(), response))
                 .doOnError(error -> log.error("Error procesando transacción {} en el core: {}",

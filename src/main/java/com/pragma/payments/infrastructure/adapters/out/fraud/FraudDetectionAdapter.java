@@ -2,11 +2,11 @@ package com.pragma.payments.infrastructure.adapters.out.fraud;
 
 import com.pragma.payments.application.ports.out.FraudDetectionPort;
 import com.pragma.payments.domain.model.Transaction;
-import io.github.resilience4j.circuitbreaker.CircuitBreaker;
-import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.reactor.bulkhead.operator.BulkheadOperator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -26,14 +26,16 @@ public class FraudDetectionAdapter implements FraudDetectionPort {
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(2);
 
     private final WebClient webClient;
-    private final CircuitBreaker circuitBreaker;
+    private final Bulkhead bulkhead;
     private final Map<String, Boolean> fraudCache;
 
     public FraudDetectionAdapter(
             WebClient webClient,
-            @Qualifier("fraudDetectionCircuitBreaker") CircuitBreakerRegistry circuitBreakerRegistry) {
+            BulkheadRegistry bulkheadRegistry) {
         this.webClient = webClient;
-        this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("fraudDetection");
+        // Bulkhead dedicado del servicio antifraude: limita a 25 las llamadas concurrentes
+        // y aísla su saturación de los demás servicios (Requirements 2.2, 5.4).
+        this.bulkhead = bulkheadRegistry.bulkhead("fraudDetectionService");
         this.fraudCache = new ConcurrentHashMap<>();
     }
 
@@ -57,6 +59,8 @@ public class FraudDetectionAdapter implements FraudDetectionPort {
                                         "Error del servicio de detección de fraude: " + response.statusCode())))
                         .bodyToMono(FraudEvaluationResponse.class)
                         .timeout(REQUEST_TIMEOUT))
+                // Bulkhead reactivo: rechaza con BulkheadFullException si hay 25 llamadas en vuelo.
+                .transformDeferred(BulkheadOperator.of(bulkhead))
                 .doOnSuccess(response -> {
                     log.info("Evaluación de fraude completada para transacción {}: isFraudulent={}",
                             transaction.getId(), response.isFraudulent());

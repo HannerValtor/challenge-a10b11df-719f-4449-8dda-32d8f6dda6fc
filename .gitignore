@@ -15,3 +15,9 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# Bitacora local de ajustes (no versionar)
+BITACORA_AJUSTES.md
+
+# jqwik (property-based testing) database
+.jqwik-database

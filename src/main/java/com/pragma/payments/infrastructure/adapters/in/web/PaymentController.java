@@ -53,6 +53,10 @@ public class PaymentController {
         log.info("Recibida solicitud de pago para operación: {} desde canal: {}",
                 request.operationNumber(), request.channel());
 
+        // Validación de canal en el borde (Requirement 4.4): un canal no admitido se rechaza
+        // ANTES de crear o tocar cualquier transacción. El GlobalExceptionHandler lo mapea a 400.
+        validateChannel(request.channel());
+
         IdempotencyKey idempotencyKey = new IdempotencyKey(
                 request.operationNumber(),
                 request.channel()
@@ -69,26 +73,19 @@ public class PaymentController {
                 .createdAt(Instant.now())
                 .build();
 
+        // El mapeo de errores a HTTP está centralizado en GlobalExceptionHandler (sin onErrorResume
+        // por tipo aquí): las señales de error se propagan y se traducen de forma no bloqueante.
         return paymentServicePort.processPayment(Mono.just(transaction))
                 .map(this::toResponse)
-                .map(ResponseEntity::ok)
-                .onErrorResume(com.pragma.payments.domain.exception.TransactionAlreadyProcessedException.class,
-                        e -> {
-                            log.warn("Transacción duplicada: {}", e.getMessage());
-                            return Mono.just(ResponseEntity.status(HttpStatus.CONFLICT)
-                                    .body(PaymentResponse.error(e.getMessage())));
-                        })
-                .onErrorResume(com.pragma.payments.domain.exception.ExternalServiceTimeoutException.class,
-                        e -> {
-                            log.error("Timeout de servicio externo: {}", e.getMessage());
-                            return Mono.just(ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
-                                    .body(PaymentResponse.error("Servicio temporalmente no disponible")));
-                        })
-                .onErrorResume(Exception.class, e -> {
-                    log.error("Error inesperado procesando pago: {}", e.getMessage(), e);
-                    return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                            .body(PaymentResponse.error("Error interno del servidor")));
-                });
+                .map(ResponseEntity::ok);
+    }
+
+    private static final java.util.Set<String> VALID_CHANNELS = java.util.Set.of("web", "mobile", "api");
+
+    private void validateChannel(String channel) {
+        if (channel == null || !VALID_CHANNELS.contains(channel.toLowerCase(java.util.Locale.ROOT))) {
+            throw new com.pragma.payments.domain.exception.InvalidChannelException(channel);
+        }
     }
 
     @GetMapping("/status/{operationNumber}/{channel}")

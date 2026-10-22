@@ -112,3 +112,10 @@ management:
       enabled: true
     ratelimiters:
       enabled: true
+    # Health indicator del bulkhead: expone el estado de la concurrencia por servicio
+    # (llamadas disponibles/en uso) en /actuator/health (Requirements 6.3, 6.4).
+    bulkheads:
+      enabled: true
+  metrics:
+    enable:
+      resilience4j: true
