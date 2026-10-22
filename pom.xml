@@ -33,11 +33,17 @@
                 <artifactId>springdoc-openapi-starter-webflux-ui</artifactId>
                 <version>2.6.0</version>
             </dependency>
+            <!--
+                BOM de Testcontainers: centraliza las versiones de todos los módulos de
+                Testcontainers (postgresql, junit-jupiter) para que queden alineadas y
+                evitar conflictos de versión entre ellos (tarea 10.3).
+            -->
             <dependency>
                 <groupId>org.testcontainers</groupId>
-                <artifactId>postgresql</artifactId>
+                <artifactId>testcontainers-bom</artifactId>
                 <version>1.20.1</version>
-                <scope>test</scope>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -100,6 +106,25 @@
             <version>1.0.9.RELEASE</version>
             <scope>test</scope>
         </dependency>
+        <!--
+            Testcontainers (scope test): el módulo postgresql levanta un PostgreSQL real
+            en un contenedor para los tests de durabilidad y smoke de esquema; el módulo
+            junit-jupiter aporta las extensiones @Testcontainers/@Container de JUnit 5.
+            Las versiones las gestiona el testcontainers-bom (dependencyManagement).
+            Estos tests se SALTAN automáticamente cuando Docker no está disponible
+            (ver com.pragma.payments.integration.*IT), de modo que el build local pasa
+            y en CI con Docker se ejecutan (tarea 10.3).
+        -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -132,6 +157,23 @@
                         <testExclude>**/adapters/out/**/*Test.java</testExclude>
                         <testExclude>**/usecases/PaymentUseCaseTest.java</testExclude>
                     </testExcludes>
+                </configuration>
+            </plugin>
+            <!--
+                Surefire: BlockHound instrumenta la JVM para detectar llamadas bloqueantes
+                sobre hilos no bloqueantes. En JDK modernos (Java 13+), la autoinstalación
+                vía ServiceLoader requiere permitir la redefinición de clases que añaden o
+                eliminan métodos; de lo contrario BlockHound.install() falla con
+                "Current VM does not support redefinition" (tarea 10.3, Req 2.3/8.1/8.2).
+                Este argLine es seguro a nivel global: solo habilita capacidades de
+                instrumentación usadas por BlockHound y no altera el comportamiento del
+                resto de los tests.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <argLine>-XX:+AllowRedefinitionToAddDeleteMethods</argLine>
                 </configuration>
             </plugin>
         </plugins>

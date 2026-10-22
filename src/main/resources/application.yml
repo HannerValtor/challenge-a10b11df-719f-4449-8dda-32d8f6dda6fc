@@ -3,20 +3,30 @@ spring:
     name: payments-service
   profiles:
     active: dev
-  r2dbc:
-    url: r2dbc:postgresql://localhost:5432/payments_db
+  # Fase 2: la persistencia de idempotencia usa Spring Data JPA con el driver JDBC de
+  # PostgreSQL (decisión de diseño D1, opción de respaldo sobre boundedElastic). La
+  # configuración previa referenciaba spring.r2dbc, incoherente con el starter JPA del
+  # pom.xml (sin starter R2DBC), lo que impedía construir el EntityManagerFactory y
+  # arrancar el contexto. Se migra a spring.datasource.* (JDBC) para que sea coherente.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/payments_db
     username: payments_user
     password: payments_pass
-    pool:
-      enabled: true
-      initial-size: 10
-      max-size: 20
-      max-idle-time: 30m
-      validation-query: SELECT 1
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: payments-hikari-pool
+      minimum-idle: 10
+      maximum-pool-size: 20
+      idle-timeout: 1800000
+      connection-test-query: SELECT 1
   jpa:
     hibernate:
+      # El esquema lo crea schema.sql (Req 1.1, 5.3), no Hibernate; validate comprueba
+      # que el mapeo de la entidad coincide con la tabla ya creada.
       ddl-auto: validate
     show-sql: true
+    # El esquema (schema.sql) se ejecuta antes de que Hibernate valide el mapeo.
+    defer-datasource-initialization: true
     properties:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
@@ -24,6 +34,21 @@ spring:
         jdbc:
           lob:
             non_contextual_creation: true
+  # Ejecuta schema.sql en el arranque para crear la tabla idempotency_record y su índice
+  # (Req 1.1, 5.3, 6.3). El script es idempotente (IF NOT EXISTS).
+  sql:
+    init:
+      mode: always
+
+payments:
+  idempotency:
+    # Periodo de vida (TTL) de un Idempotency_Record antes de ser elegible para
+    # eliminación. Duration ISO-8601 (Requirements 6.1, 6.2).
+    ttl: PT24H
+    cleanup:
+      # Periodicidad del Cleanup_Process que elimina los records expirados.
+      # Duration ISO-8601 (Requirement 6.2).
+      fixed-delay: PT1H
 
 server:
   port: 8080
@@ -94,8 +119,8 @@ logging:
     root: INFO
     org.springframework.web: DEBUG
     com.pragma.payments: DEBUG
-    io.r2dbc.postgresql.QUERY: DEBUG
-    io.r2dbc.postgresql.PARAM: DEBUG
+    org.hibernate.SQL: DEBUG
+    org.hibernate.orm.jdbc.bind: TRACE
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
 
