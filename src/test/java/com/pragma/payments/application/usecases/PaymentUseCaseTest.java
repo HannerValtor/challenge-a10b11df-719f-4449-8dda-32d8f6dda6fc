@@ -1,11 +1,12 @@
 package com.pragma.payments.application.usecases;
 
-
-import com.pragma.payments.infrastructure.adapters.out.core.CoreBankingAdapter;
-import com.pragma.payments.application.ports.out.FraudDetectionPort;
-import com.pragma.payments.application.ports.out.RiskBureauPort;
+import com.pragma.payments.application.orchestrator.IdempotencyOrchestrator;
+import com.pragma.payments.application.ports.out.IdempotencyStorePort;
 import com.pragma.payments.domain.model.IdempotencyKey;
+import com.pragma.payments.domain.model.IdempotencyRecord;
+import com.pragma.payments.domain.model.RecordStatus;
 import com.pragma.payments.domain.model.Transaction;
+import com.pragma.payments.domain.model.Transaction.TransactionStatus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -17,238 +18,175 @@ import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
-import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.time.Duration;
+import java.time.Instant;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+/**
+ * Tests unitarios (basados en ejemplos) del coordinador delgado {@link PaymentUseCase}.
+ *
+ * <p>Tras el refactor de la tarea 7.1, {@code PaymentUseCase} dejó de contener la lógica
+ * de orquestación de idempotencia y de la cadena de servicios externos: ahora delega por
+ * completo en {@link IdempotencyOrchestrator} para el flujo principal y solo consulta el
+ * {@link IdempotencyStorePort} para las operaciones de lectura ({@code isTransactionProcessed},
+ * {@code getProcessedTransaction}).</p>
+ *
+ * <p>Estos tests verifican, con {@code JUnit 5 + Mockito + Reactor StepVerifier}:</p>
+ * <ul>
+ *   <li><b>Delegación pura</b> de {@code processPayment} en {@code orchestrator.resolve(key, tx)}:
+ *       se invoca exactamente una vez con la clave y la transacción, y el {@code Mono} devuelto
+ *       es el que produce el orquestador (Requirement 3.1).</li>
+ *   <li><b>Ausencia de acceso directo a puertos externos/store en el flujo principal</b>: el
+ *       coordinador ya no inyecta {@code FraudDetectionPort}/{@code RiskBureauPort}/
+ *       {@code CoreBankingPort} (su constructor solo recibe orquestador + store) y no conduce la
+ *       cadena de idempotencia desde el use case (no hay {@code reserve}/{@code complete}/
+ *       {@code markFailedOrRelease}) (Requirement 2.4).</li>
+ *   <li>Comportamiento de las consultas de solo lectura vía {@code IdempotencyStorePort}
+ *       (COMPLETED &rarr; true/resultado; ausente &rarr; false/vacío; no-COMPLETED &rarr; false/vacío).</li>
+ * </ul>
+ */
 @ExtendWith(MockitoExtension.class)
-@DisplayName("PaymentUseCase - Tests de caso de uso de pagos")
+@DisplayName("PaymentUseCase - coordinador delgado (delegación pura en el orquestador, sin acceso directo a puertos externos)")
 class PaymentUseCaseTest {
 
-    @Mock
-    private FraudDetectionPort fraudDetectionPort;
+    private static final Duration TTL = Duration.ofHours(24);
 
     @Mock
-    private RiskBureauPort riskBureauPort;
+    private IdempotencyOrchestrator orchestrator;
 
     @Mock
-    private com.pragma.payments.infrastructure.adapters.out.core.CoreBankingAdapter coreBankingAdapter;
+    private IdempotencyStorePort idempotencyStore;
 
     private PaymentUseCase paymentUseCase;
 
-    private Transaction createTestTransaction() {
-        return Transaction.builder()
-                .id(UUID.randomUUID().toString())
-                .accountId("ACC-12345")
-                .amount(new BigDecimal("1000.00"))
-                .channel("WEB")
-                .status("PENDING")
-                .createdAt(LocalDateTime.now())
-                .build();
-    }
-
-    private IdempotencyKey createIdempotencyKey(String operationNumber, String channel) {
-        return IdempotencyKey.builder()
-                .operationNumber(operationNumber)
-                .channel(channel)
-                .build();
-    }
+    private IdempotencyKey key;
+    private Transaction transaction;
 
     @BeforeEach
     void setUp() {
-        paymentUseCase = new PaymentUseCase(
-                fraudDetectionPort,
-                riskBureauPort,
-                coreBankingAdapter
-        );
+        paymentUseCase = new PaymentUseCase(orchestrator, idempotencyStore);
+        key = new IdempotencyKey("OP-1", "web");
+        transaction = Transaction.builder()
+                .id("tx-1")
+                .idempotencyKey(key)
+                .accountId("acc-1")
+                .amount(new BigDecimal("100.00"))
+                .currency("USD")
+                .channel("web")
+                .status(TransactionStatus.PENDING)
+                .build();
+    }
+
+    private IdempotencyRecord recordWithStatus(RecordStatus status, Transaction result) {
+        Instant now = Instant.now();
+        return new IdempotencyRecord(key, status, result, now, now.plus(TTL));
     }
 
     @Nested
-    @DisplayName("Escenarios de Éxito")
-    class SuccessScenarios {
+    @DisplayName("processPayment - delegación pura en el orquestador (Req 3.1)")
+    class ProcessPaymentDelegation {
 
         @Test
-        @DisplayName("Debe procesar exitosamente una transacción")
-        void shouldProcessTransactionSuccessfully() {
-            Transaction transaction = createTestTransaction();
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(10));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
-            when(coreBankingAdapter.processTransaction(any())).thenReturn(Mono.just("APPROVED"));
+        @DisplayName("delega en orchestrator.resolve(key, tx) exactamente una vez y retorna su Mono")
+        void delegatesToOrchestratorResolve() {
+            Transaction resolved = Transaction.builder()
+                    .id("tx-resolved")
+                    .idempotencyKey(key)
+                    .channel("web")
+                    .status(TransactionStatus.COMPLETED)
+                    .build();
+            when(orchestrator.resolve(eq(key), eq(transaction))).thenReturn(Mono.just(resolved));
 
             StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
-                    .assertNext(result -> {
-                        assertThat(result).isNotNull();
-                        assertThat(result.getStatus()).isEqualTo("COMPLETED");
-                    })
+                    .assertNext(result -> assertThat(result).isSameAs(resolved))
                     .verifyComplete();
+
+            // Delegación pura: resolve invocado exactamente una vez con la clave y la transacción.
+            verify(orchestrator).resolve(key, transaction);
+            verifyNoMoreInteractions(orchestrator);
         }
 
         @Test
-        @DisplayName("Debe aprobar cuando el riesgo es bajo")
-        void shouldApproveWhenRiskIsLow() {
-            Transaction transaction = createTestTransaction();
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(5));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
-            when(coreBankingAdapter.processTransaction(any())).thenReturn(Mono.just("APPROVED"));
+        @DisplayName("no accede al store ni conduce la cadena de idempotencia en el flujo principal (Req 2.4)")
+        void mainFlowDoesNotDriveStoreChain() {
+            Transaction resolved = Transaction.builder()
+                    .id("tx-resolved")
+                    .idempotencyKey(key)
+                    .channel("web")
+                    .status(TransactionStatus.COMPLETED)
+                    .build();
+            when(orchestrator.resolve(eq(key), eq(transaction))).thenReturn(Mono.just(resolved));
 
             StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
-                    .assertNext(result -> assertThat(result.getStatus()).isEqualTo("COMPLETED"))
+                    .expectNext(resolved)
                     .verifyComplete();
+
+            // El use case NO orquesta idempotencia directamente contra el store: esa
+            // responsabilidad vive en el IdempotencyOrchestrator (D1).
+            verify(idempotencyStore, never()).find(any());
+            verify(idempotencyStore, never()).reserve(any());
+            verify(idempotencyStore, never()).complete(any(), any());
+            verify(idempotencyStore, never()).markFailedOrRelease(any());
+            verify(idempotencyStore, never()).deleteExpired(any());
+            verifyNoInteractions(idempotencyStore);
+        }
+
+        @Test
+        @DisplayName("propaga el error emitido por el orquestador sin tocar el store")
+        void propagatesOrchestratorError() {
+            RuntimeException boom = new RuntimeException("resolve failed");
+            when(orchestrator.resolve(eq(key), eq(transaction))).thenReturn(Mono.error(boom));
+
+            StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
+                    .expectErrorMatches(err -> err == boom)
+                    .verify();
+
+            verify(orchestrator).resolve(key, transaction);
+            verifyNoInteractions(idempotencyStore);
         }
     }
 
     @Nested
-    @DisplayName("Escenarios de Fallo por Validaciones")
-    class ValidationFailureScenarios {
+    @DisplayName("isTransactionProcessed - consulta de solo lectura vía store")
+    class IsTransactionProcessed {
 
         @Test
-        @DisplayName("Debe rechazar cuando el motor antifraude detecta fraude")
-        void shouldRejectWhenFraudDetected() {
-            Transaction transaction = createTestTransaction();
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(false));
-
-            StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
-                    .expectErrorMatches(e -> e.getMessage().contains("fraud"))
-                    .verify();
-        }
-
-        @Test
-        @DisplayName("Debe rechazar cuando la cuenta está en lista negra")
-        void shouldRejectWhenAccountIsBlacklisted() {
-            Transaction transaction = createTestTransaction();
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(10));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(true));
-
-            StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
-                    .expectErrorMatches(e -> e.getMessage().contains("blacklisted"))
-                    .verify();
-        }
-
-        @Test
-        @DisplayName("Debe rechazar cuando el riesgo es alto")
-        void shouldRejectWhenRiskIsHigh() {
-            Transaction transaction = createTestTransaction();
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(85));
-
-            StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
-                    .expectErrorMatches(e -> e.getMessage().contains("risk"))
-                    .verify();
-        }
-    }
-
-    @Nested
-    @DisplayName("Escenarios de Concurrencia")
-    class ConcurrencyScenarios {
-
-        @Test
-        @DisplayName("Debe procesar múltiples transacciones concurrentemente")
-        void shouldHandleConcurrentTransactions() throws InterruptedException {
-            int concurrentRequests = 10;
-            CountDownLatch latch = new CountDownLatch(concurrentRequests);
-            AtomicInteger successCount = new AtomicInteger(0);
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(10));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
-            when(coreBankingAdapter.processTransaction(any())).thenReturn(Mono.just("APPROVED"));
-
-            ExecutorService executor = Executors.newFixedThreadPool(concurrentRequests);
-
-            for (int i = 0; i < concurrentRequests; i++) {
-                final int index = i;
-                executor.submit(() -> {
-                    try {
-                        Transaction tx = Transaction.builder()
-                                .id(UUID.randomUUID().toString())
-                                .accountId("ACC-" + index)
-                                .amount(new BigDecimal("1000.00"))
-                                .channel("WEB")
-                                .status("PENDING")
-                                .createdAt(LocalDateTime.now())
-                                .build();
-
-                        paymentUseCase.processPayment(Mono.just(tx))
-                                .doOnSuccess(result -> successCount.incrementAndGet())
-                                .block();
-                    } finally {
-                        latch.countDown();
-                    }
-                });
-            }
-
-            latch.await();
-            executor.shutdown();
-
-            assertThat(successCount.get()).isEqualTo(concurrentRequests);
-        }
-
-        @Test
-        @DisplayName("Debe mantener el orden de procesamiento")
-        void shouldMaintainProcessingOrder() {
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(10));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
-            when(coreBankingAdapter.processTransaction(any())).thenReturn(Mono.just("APPROVED"));
-
-            var transactions = java.util.List.of(
-                    createTestTransaction(),
-                    createTestTransaction(),
-                    createTestTransaction()
-            );
-
-            var result = paymentUseCase.processPayment(Mono.just(transactions.get(0)))
-                    .then(paymentUseCase.processPayment(Mono.just(transactions.get(1))))
-                    .then(paymentUseCase.processPayment(Mono.just(transactions.get(2))));
-
-            StepVerifier.create(result)
-                    .assertNext(r -> assertThat(r.getStatus()).isEqualTo("COMPLETED"))
-                    .verifyComplete();
-        }
-    }
-
-    @Nested
-    @DisplayName("Escenarios de Idempotencia")
-    class IdempotencyScenarios {
-
-        @Test
-        @DisplayName("Debe indicar que la transacción ya fue procesada")
-        void shouldIndicateTransactionAlreadyProcessed() {
-            IdempotencyKey key = createIdempotencyKey("OP-123", "WEB");
-
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any())).thenReturn(Mono.just(10));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
-            when(coreBankingAdapter.processTransaction(any())).thenReturn(Mono.just("APPROVED"));
-
-            Transaction tx = createTestTransaction();
-            paymentUseCase.processPayment(Mono.just(tx)).block();
+        @DisplayName("COMPLETED -> true")
+        void completedReturnsTrue() {
+            Transaction result = Transaction.builder().id("tx-done").idempotencyKey(key).channel("web")
+                    .status(TransactionStatus.COMPLETED).build();
+            when(idempotencyStore.find(key)).thenReturn(Mono.just(recordWithStatus(RecordStatus.COMPLETED, result)));
 
             StepVerifier.create(paymentUseCase.isTransactionProcessed(key))
                     .expectNext(true)
                     .verifyComplete();
+
+            verifyNoInteractions(orchestrator);
         }
 
         @Test
-        @DisplayName("Debe retornar false para transacción no procesada")
-        void shouldReturnFalseForNonProcessedTransaction() {
-            IdempotencyKey key = createIdempotencyKey("OP-NEW", "MOBILE");
+        @DisplayName("IN_PROGRESS -> false")
+        void inProgressReturnsFalse() {
+            when(idempotencyStore.find(key))
+                    .thenReturn(Mono.just(recordWithStatus(RecordStatus.IN_PROGRESS, null)));
+
+            StepVerifier.create(paymentUseCase.isTransactionProcessed(key))
+                    .expectNext(false)
+                    .verifyComplete();
+        }
+
+        @Test
+        @DisplayName("ausente -> false")
+        void absentReturnsFalse() {
+            when(idempotencyStore.find(key)).thenReturn(Mono.empty());
 
             StepVerifier.create(paymentUseCase.isTransactionProcessed(key))
                     .expectNext(false)
@@ -257,44 +195,39 @@ class PaymentUseCaseTest {
     }
 
     @Nested
-    @DisplayName("Escenarios de Manejo de Fallos Temporales")
-    class TemporaryFailureScenarios {
+    @DisplayName("getProcessedTransaction - consulta de solo lectura vía store")
+    class GetProcessedTransaction {
 
         @Test
-        @DisplayName("Debe manejar fallo temporal del servicio de riesgo")
-        void shouldHandleTemporaryRiskServiceFailure() {
-            Transaction transaction = createTestTransaction();
+        @DisplayName("COMPLETED -> resultado almacenado")
+        void completedReturnsStoredResult() {
+            Transaction result = Transaction.builder().id("tx-done").idempotencyKey(key).channel("web")
+                    .status(TransactionStatus.COMPLETED).build();
+            when(idempotencyStore.find(key)).thenReturn(Mono.just(recordWithStatus(RecordStatus.COMPLETED, result)));
 
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any()))
-                    .thenReturn(Mono.error(new RuntimeException("Temporary failure")));
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
+            StepVerifier.create(paymentUseCase.getProcessedTransaction(key))
+                    .assertNext(tx -> assertThat(tx).isSameAs(result))
+                    .verifyComplete();
 
-            StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction)))
-                    .expectError(RuntimeException.class)
-                    .verify();
+            verifyNoInteractions(orchestrator);
         }
 
         @Test
-        @DisplayName("Debe reintentar automáticamente en fallos temporales")
-        void shouldRetryOnTemporaryFailures() {
-            Transaction transaction = createTestTransaction();
-            AtomicInteger attemptCount = new AtomicInteger(0);
+        @DisplayName("FAILED (no COMPLETED) -> vacío")
+        void nonCompletedReturnsEmpty() {
+            when(idempotencyStore.find(key))
+                    .thenReturn(Mono.just(recordWithStatus(RecordStatus.FAILED, null)));
 
-            when(fraudDetectionPort.evaluateTransaction(any())).thenReturn(Mono.just(true));
-            when(riskBureauPort.getRiskScore(any()))
-                    .thenAnswer(invocation -> {
-                        if (attemptCount.incrementAndGet() < 3) {
-                            return Mono.error(new RuntimeException("Temporary failure"));
-                        }
-                        return Mono.just(10);
-                    });
-            when(riskBureauPort.isAccountBlacklisted(any())).thenReturn(Mono.just(false));
-            when(coreBankingAdapter.processTransaction(any())).thenReturn(Mono.just("APPROVED"));
+            StepVerifier.create(paymentUseCase.getProcessedTransaction(key))
+                    .verifyComplete();
+        }
 
-            StepVerifier.create(paymentUseCase.processPayment(Mono.just(transaction))
-                    .retry(2))
-                    .assertNext(result -> assertThat(result.getStatus()).isEqualTo("COMPLETED"))
+        @Test
+        @DisplayName("ausente -> vacío")
+        void absentReturnsEmpty() {
+            when(idempotencyStore.find(key)).thenReturn(Mono.empty());
+
+            StepVerifier.create(paymentUseCase.getProcessedTransaction(key))
                     .verifyComplete();
         }
     }

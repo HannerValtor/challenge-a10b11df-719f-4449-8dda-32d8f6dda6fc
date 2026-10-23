@@ -26,6 +26,17 @@ import java.time.Instant;
  * se aísla en {@code Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic())},
  * preservando el contrato reactivo sin bloquear el Event Loop (Req 8.1, 8.2).</p>
  *
+ * <p><strong>Único salto de scheduler por operación (D5 / H7, Req 6.4, 7.10).</strong>
+ * Cada operación de persistencia ({@link #reserve}, {@link #find}, {@link #complete},
+ * {@link #markFailedOrRelease}, {@link #deleteExpired}) aplica <strong>exactamente un</strong>
+ * {@code subscribeOn(Schedulers.boundedElastic())} y ese salto es el único autorizado para
+ * el acceso bloqueante al almacén de idempotencia. Este adaptador es el <strong>propietario
+ * exclusivo</strong> del cambio de scheduler bloqueante: los colaboradores de la capa de
+ * aplicación (orquestador, cadena, use case) <strong>no deben</strong> envolver estas
+ * llamadas en un segundo {@code subscribeOn}/{@code publishOn} hacia {@code boundedElastic},
+ * evitando así los saltos de scheduler redundantes identificados en H7 sin renunciar al
+ * único salto necesario que mantiene la JPA bloqueante fuera del event-loop de Netty.</p>
+ *
  * <p>La atomicidad de la reserva bajo condiciones de carrera se delega a la restricción
  * de unicidad sobre {@code idempotency_key}: {@link #reserve(IdempotencyRecord)} ejecuta
  * una inserción condicional ({@code INSERT} puro) y traduce la violación de unicidad

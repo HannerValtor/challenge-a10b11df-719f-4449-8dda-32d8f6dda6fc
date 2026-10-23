@@ -13,11 +13,28 @@ spring:
     username: payments_user
     password: payments_pass
     driver-class-name: org.postgresql.Driver
+    # Fase 3 (D5, H8): dimensionamiento explícito del pool HikariCP. El pool es el
+    # cuello de botella de recursos: cada operacion de idempotencia (find/reserve/
+    # complete/delete) toma una conexion via un hilo de boundedElastic. Se fijan todos
+    # los parametros para evitar agotamiento silencioso y recortar conexiones zombie.
+    # Invariante: minimum-idle (10) <= maximum-pool-size (20); todos los valores > 0.
+    # Requirements 6.1, 6.3.
     hikari:
       pool-name: payments-hikari-pool
-      minimum-idle: 10
+      # Tamano maximo del pool. Acota el numero de conexiones activas concurrentes y, a
+      # su vez, el numero util de hilos de boundedElastic que pueden pedir conexion (D5).
       maximum-pool-size: 20
-      idle-timeout: 1800000
+      # Minimo de conexiones ociosas mantenidas listas. <= maximum-pool-size (invariante).
+      minimum-idle: 10
+      # ms: si no hay conexion libre en este intervalo, la solicitud falla con error de
+      # agotamiento del pool (fallar rapido, sin bloquear mas alla del timeout). Req 6.3.
+      connection-timeout: 3000
+      # ms: vida maxima de una conexion antes de ser reciclada (< tiempo de corte de la BD).
+      max-lifetime: 1800000
+      # ms: tiempo que una conexion puede permanecer ociosa antes de ser retirada
+      # (solo por encima de minimum-idle).
+      idle-timeout: 600000
+      # Consulta ligera de validacion de conexiones.
       connection-test-query: SELECT 1
   jpa:
     hibernate:
@@ -49,6 +66,25 @@ payments:
       # Periodicidad del Cleanup_Process que elimina los records expirados.
       # Duration ISO-8601 (Requirement 6.2).
       fixed-delay: PT1H
+    # Fase 3 (D3, H6): caché de lectura de idempotencia. Solo cachea registros COMPLETED
+    # (inmutables) para evitar reconsultar la BD ante duplicados y consultas repetidas.
+    # El TTL de la caché debe ser <= payments.idempotency.ttl (Requirement 4.6); si lo
+    # supera, CacheConfig lo acota al TTL de idempotencia de forma defensiva.
+    cache:
+      maximum-size: 10000
+      ttl: PT1H
+
+# Fase 3 (D2, H1, H9): timeouts coherentes y externalizados por servicio externo.
+# Se enlazan a ExternalTimeoutProperties (campos Duration fraud/risk/core). Cada valor
+# se expresa como un entero en milisegundos; Spring Boot enlaza un entero sin unidad a
+# Duration como milisegundos. El timeout de riesgo (2500ms) es estrictamente > 2000ms,
+# cumpliendo el requisito del reto (Requirements 1.1, 1.2, 1.3).
+external:
+  services:
+    timeouts:
+      fraud: 1000
+      risk: 2500
+      core: 1000
 
 server:
   port: 8080

@@ -131,7 +131,7 @@ public class PaymentController {
     private PaymentResponse toResponse(Transaction transaction) {
         return PaymentResponse.builder()
                 .transactionId(transaction.getId())
-                .status(transaction.getStatus())
+                .status(transaction.getStatus() != null ? transaction.getStatus().name() : null)
                 .amount(transaction.getAmount())
                 .currency(transaction.getCurrency())
                 .processedAt(transaction.getProcessedAt())

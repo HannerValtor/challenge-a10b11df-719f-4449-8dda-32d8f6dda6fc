@@ -22,7 +22,7 @@ public class Transaction {
     private String currency;
     private String channel;
     private String description;
-    private String status;
+    private TransactionStatus status;
     private String failureReason;
     private Integer riskScore;
     private Boolean fraudDetected;
@@ -32,7 +32,7 @@ public class Transaction {
 
     public Transaction() {
         this.id = UUID.randomUUID().toString();
-        this.status = TransactionStatus.PENDING.name();
+        this.status = TransactionStatus.PENDING;
         this.createdAt = Instant.now();
     }
 
@@ -48,8 +48,8 @@ public class Transaction {
     }
 
     public void validateNotAlreadyProcessed() {
-        if (TransactionStatus.COMPLETED.name().equals(this.status)
-                || TransactionStatus.DUPLICATE.name().equals(this.status)) {
+        if (this.status == TransactionStatus.COMPLETED
+                || this.status == TransactionStatus.DUPLICATE) {
             throw new TransactionAlreadyProcessedException(
                     this.idempotencyKey != null ? this.idempotencyKey.toUniqueString() : "unknown",
                     this.channel,
@@ -60,7 +60,7 @@ public class Transaction {
     }
 
     public void markAsCompleted(String externalReference) {
-        this.status = TransactionStatus.COMPLETED.name();
+        this.status = TransactionStatus.COMPLETED;
         this.externalReference = externalReference;
         this.processedAt = Instant.now();
     }
@@ -97,7 +97,7 @@ public class Transaction {
         return description;
     }
 
-    public String getStatus() {
+    public TransactionStatus getStatus() {
         return status;
     }
 
@@ -154,11 +154,11 @@ public class Transaction {
     }
 
     public void setStatus(String status) {
-        this.status = status;
+        this.status = status != null ? TransactionStatus.valueOf(status) : null;
     }
 
     public void setStatus(TransactionStatus status) {
-        this.status = status != null ? status.name() : null;
+        this.status = status;
     }
 
     public void setFailureReason(String failureReason) {
@@ -206,7 +206,7 @@ public class Transaction {
                 ", accountId='" + accountId + '\'' +
                 ", amount=" + amount +
                 ", channel='" + channel + '\'' +
-                ", status='" + status + '\'' +
+                ", status=" + status +
                 ", createdAt=" + createdAt +
                 '}';
     }
@@ -250,12 +250,12 @@ public class Transaction {
         }
 
         public Builder status(String status) {
-            transaction.status = status;
+            transaction.status = status != null ? TransactionStatus.valueOf(status) : null;
             return this;
         }
 
         public Builder status(TransactionStatus status) {
-            transaction.status = status != null ? status.name() : null;
+            transaction.status = status;
             return this;
         }
 

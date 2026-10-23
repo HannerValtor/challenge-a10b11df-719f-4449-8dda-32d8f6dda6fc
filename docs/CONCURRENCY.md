@@ -101,3 +101,98 @@ Verificado con un test de 16 hilos simultáneos: exactamente 1 éxito, 15 duplic
 
 Este documento corresponde a la **Fase 1** (diseño inicial funcional). El tuning fino de pools,
 el backpressure elaborado y el benchmarking corresponden a la **Fase 3** y quedan fuera de alcance.
+
+---
+
+# Fase 3 — Optimización: tuning de pools y análisis de cuello de botella
+
+Esta sección es el entregable de concurrencia de la **Fase 3**. Documenta el dimensionamiento
+final del pool de conexiones (decisión D5), el valor anterior y nuevo de cada parámetro ajustado
+con su justificación cuantitativa, y el análisis del cuello de botella del sistema con la métrica
+que lo evidencia y la mitigación aplicada.
+
+> Spec completo: `.kiro/specs/optimizacion-refactor-fase3/` (requirements, design, tasks).
+
+## 9. Dimensionamiento del pool de conexiones (D5)
+
+En la Fase 1 el pool de conexiones a BD no existía como cuello de botella porque la idempotencia
+vivía en memoria (`ConcurrentHashMap`). En la Fase 2 la idempotencia pasó a ser **persistente**
+(JPA/PostgreSQL sobre HikariCP), de modo que toda operación de idempotencia (`find`, `reserve`,
+`complete`, `markFailedOrRelease`, `deleteExpired`) consume una conexión del pool a través de un
+hilo de `boundedElastic`. La Fase 3 dimensiona explícitamente ese pool (hallazgo H8).
+
+### 9.1 Valores finales (D5)
+
+Configurados en `src/main/resources/application.yml` bajo `spring.datasource.hikari`:
+
+| Parámetro | Valor final | Rol |
+|---|---|---|
+| `maximum-pool-size` | 20 | Conexiones activas máximas; acota el fan-out a la BD |
+| `minimum-idle` | 10 | Conexiones ociosas listas para absorber ráfagas |
+| `connection-timeout` | 3000 ms | Fallo rápido si no hay conexión libre (no bloqueo indefinido) |
+| `max-lifetime` | 1 800 000 ms (30 min) | Recicla conexiones antes del corte del lado servidor |
+| `idle-timeout` | 600 000 ms (10 min) | Retira conexiones ociosas por encima de `minimum-idle` |
+| `connection-test-query` | `SELECT 1` | Validación ligera de conexión |
+
+Invariante respetado: `minimum-idle (10) <= maximum-pool-size (20)`, todos los valores positivos
+(Requirement 6.1).
+
+### 9.2 Antes vs. después, con justificación cuantitativa
+
+| Parámetro | Fase 1/2 (antes) | Fase 3 (nuevo) | Justificación cuantitativa |
+|---|---|---|---|
+| `maximum-pool-size` | 20 (implícito/por defecto del arranque previo) | **20 (explícito)** | Carga I/O-bound con JDBC: el límite útil del pool ronda `(2 × núcleos) + husos de disco efectivos`. Para 4–8 núcleos efectivos, 20 cubre el fan-out concurrente de idempotencia sin sobre-provisionar conexiones que el motor tendría que mantener abiertas. Se fija explícito para que **el pool acote a `boundedElastic`, no al revés**. |
+| `minimum-idle` | 10 | **10** | Mantener la mitad del pool caliente evita el coste de *handshake* TCP/TLS + autenticación (del orden de decenas de ms por conexión fría) en la primera ráfaga tras un periodo ocioso. |
+| `connection-timeout` | no fijado (default 30 000 ms) | **3000 ms** | Con default de 30 s, una solicitud podía quedar 30 s esperando una conexión bajo saturación, muy por encima del timeout de los servicios externos (≤ 2,5 s). Bajarlo a 3 s hace que el agotamiento del pool se manifieste como **fallo rápido** (→ 503 reintetable) en vez de latencia acumulada. |
+| `max-lifetime` | no fijado | **1 800 000 ms** | Reciclar conexiones por debajo del tiempo de corte típico del lado servidor (p. ej. `idle_in_transaction_session_timeout` / balanceadores) evita usar conexiones medio-muertas que fallarían en mitad de una transacción. |
+| `idle-timeout` | no fijado | **600 000 ms** | Libera conexiones ociosas por encima de `minimum-idle` tras 10 min, devolviendo recursos al motor sin penalizar el estado caliente mínimo. |
+| Tamaño de `boundedElastic` | default de Reactor (`10 × núcleos`, hasta cientos de hilos) | **Acotado a ≤ `maximum-pool-size`** | Con el default, decenas/cientos de hilos de `boundedElastic` podrían pedir conexión a un pool de 20 simultáneamente: el exceso se encola o expira en `connection-timeout`. Alinear `boundedElastic` al pool (D5, Req 6.2/6.5) evita el agotamiento silencioso: el número de hilos que piden conexión no supera las conexiones disponibles. Se fija en el arranque vía `BoundedElasticSchedulerConfig.align()` antes de la primera suscripción. |
+
+## 10. Análisis de cuello de botella (evidencia y mitigación)
+
+### 10.1 Cuello de botella primario — cadena de servicios externos
+
+**Componente limitante:** la cadena secuencial fraude → riesgo → core (3 llamadas HTTP por
+transacción nueva).
+
+**Métrica observada:** latencia de pared por transacción dominada por la suma de las 3 esperas de
+red más reintentos. Con el timeout del buró mal dimensionado en la Fase 1 (2 s = límite del reto,
+no `> 2 s`) y `maxAttempts=3` con backoff exponencial, el peor caso del buró podía acumular varios
+segundos por transacción, y el timeout envolvente de 3 s del use case (H1) **nunca disparaba** para
+riesgo/core (doble control de tiempo incoherente).
+
+**Mitigación aplicada (D2, H1, H9):**
+- Timeouts coherentes y externalizados por servicio (`ExternalTimeoutProperties`): fraude 1000 ms,
+  **riesgo 2500 ms (> 2 s, requisito del reto)**, core 1000 ms. Se eliminó el timeout envolvente de
+  3 s del use case: cada adaptador es el único dueño de su control de tiempo (Req 1.10).
+- El fallo rápido coherente libera el permiso del bulkhead y la conexión antes, reduciendo el tiempo
+  que los recursos quedan retenidos esperando un servicio lento.
+
+### 10.2 Cuello de botella secundario (de recursos) — pool de conexiones + saltos de scheduler
+
+**Componente limitante:** HikariCP (20) combinado con `boundedElastic`, más saltos de scheduler
+redundantes (H7) y lecturas repetidas a BD (H6).
+
+**Métrica observada:** bajo alta concurrencia, cada pago retiene una conexión en cada paso de
+persistencia; al superar las 20 conexiones, las operaciones de idempotencia se encolan y la latencia
+se dispara (y, con el `connection-timeout` por defecto de 30 s, el síntoma era latencia, no error).
+Además, `boundedElastic` se aplicaba **dos veces** (use case + adaptador, H7), añadiendo overhead de
+planificación sin beneficio.
+
+**Mitigación aplicada (D3, D5, H6, H7):**
+- Un **único** `subscribeOn(boundedElastic)` por operación de persistencia, propiedad exclusiva del
+  `IdempotencyStoreAdapter` (Req 6.4, 7.10): se eliminó el segundo salto.
+- `boundedElastic` alineado a `maximum-pool-size` (Req 6.2/6.5): los hilos que piden conexión no
+  exceden el pool.
+- **Caché de lectura `CachingIdempotencyStore`** (D3) para registros `COMPLETED` inmutables: las
+  solicitudes duplicadas y las consultas repetidas (`/status`, reintentos) se sirven desde memoria,
+  reduciendo el fan-out de conexiones a la BD (Req 4.x).
+- `connection-timeout` de 3 s convierte el agotamiento en fallo rápido observable (503) en lugar de
+  latencia acumulada.
+
+### 10.3 Operación que más recursos consume
+
+No hay trabajo CPU-bound relevante: el recurso crítico son **conexiones/hilos bloqueados esperando
+I/O** (red externa y JDBC). Por eso la optimización se centró en acotar y alinear pools, evitar
+accesos redundantes (caché de idempotencia y caché determinista de fraude) y hacer coherentes los
+timeouts para que el fallo rápido libere recursos cuanto antes.

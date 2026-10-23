@@ -138,4 +138,96 @@ mvn clean compile
 
 ---
 
+# Arquitectura de Fase 3 — Optimización y Refactorización
+
+Esta sección documenta la solución de la **Fase 3**: las decisiones de optimización y
+refactorización, el flujo de procesamiento de un pago de extremo a extremo y el comportamiento del
+sistema ante fallos transitorios de los servicios externos.
+
+> Specs completos: `.kiro/specs/optimizacion-refactor-fase3/` (requirements, design, tasks).
+> Detalle de tuning de pools y análisis de cuello de botella: `docs/CONCURRENCY.md` (secciones 9–10).
+
+## Stack
+
+Java 21 · Spring Boot 3.5 · Spring WebFlux + Project Reactor (reactivo no bloqueante sobre Netty) ·
+Spring Data JPA + HikariCP (PostgreSQL) · Resilience4j (Circuit Breaker, Retry, Bulkhead) ·
+Caffeine (caché) · arquitectura hexagonal (puertos y adaptadores). El acceso JPA bloqueante se aísla
+en `Schedulers.boundedElastic()`; el event-loop de Netty nunca se bloquea (verificado con BlockHound).
+
+## Decisiones de optimización y refactorización
+
+| ID | Decisión | Qué resuelve |
+|---|---|---|
+| **D1** | Separar `IdempotencyOrchestrator` (ciclo de vida de idempotencia) de `PaymentProcessingChain` (cadena externa fraude→riesgo→core). `PaymentUseCase` queda como coordinador delgado. | SRP: cada clase una razón de cambio; testeo aislado (H4). |
+| **D2** | Centralizar timeouts por servicio en `ExternalTimeoutProperties` (externalizados en `application.yml`): fraude 1000 ms, **riesgo 2500 ms (> 2 s)**, core 1000 ms. Eliminar el timeout envolvente del use case. | Coherencia de timeouts; cumple el requisito del reto (buró > 2 s); un único control de tiempo por servicio (H1, H9). |
+| **D3** | Caché de lectura `CachingIdempotencyStore` (Caffeine) **solo para registros `COMPLETED`** inmutables, como decorator del puerto. | Evita re-consultar la BD en duplicados y consultas repetidas (H6). |
+| **D4** | Reemplazar la caché ad-hoc de fraude por Caffeine con `maximumSize` + `expireAfterWrite` y clave determinista (sin `currentTimeMillis`). | Acota memoria; clave estable; sin fugas (H5). |
+| **D5** | Dimensionar HikariCP explícitamente y alinear `boundedElastic` al `maximum-pool-size`. | Evita el agotamiento silencioso del pool (H8). |
+| **D6** | Mover Circuit Breaker/Retry a métodos públicos interceptables de los adapters; quitar las anotaciones inertes sobre métodos privados del use case. | Resiliencia efectiva; elimina código engañoso (H2). |
+| **D7** | Reserva atómica solo por la restricción de unicidad de la BD; sin `synchronized`/`ReentrantLock`. | Atomicidad sin bloqueo incompatible con el event-loop. |
+
+## Flujo de un pago de extremo a extremo
+
+```
+POST /api/v1/payments
+  └─ PaymentController: valida el canal (web|mobile|api); canal inválido → 400
+       └─ PaymentUseCase.processPayment  (coordinador delgado, delega)
+            └─ IdempotencyOrchestrator.resolve(key, tx)
+                 ├─ store.find(key)  [vía CachingIdempotencyStore]
+                 │    ├─ COMPLETED   → devuelve el resultado cacheado (sin cadena externa) → 200
+                 │    ├─ IN_PROGRESS → TransactionAlreadyProcessedException → 409
+                 │    └─ FAILED/ausente → continúa a reservar
+                 ├─ store.reserve(IN_PROGRESS)  [INSERT atómico; duplicado → relee y decide]
+                 ├─ PaymentProcessingChain.execute(tx)   [exactamente una vez]
+                 │    └─ fraude → riesgo → core   (short-circuit si REJECTED)
+                 ├─ éxito  → store.complete(key, result) → puebla caché → 200
+                 └─ fallo transitorio → store.markFailedOrRelease(key) → propaga → 503
+```
+
+- **Idempotencia exactamente-una-ejecución:** ante K solicitudes concurrentes con la misma clave
+  (`operationNumber + "_" + channel`), exactamente una gana la reserva y ejecuta la cadena; las K−1
+  restantes reciben el resultado cacheado (si `COMPLETED`) o 409 (si `IN_PROGRESS`), sin re-ejecutar.
+- **Caché coherente:** solo se cachean registros `COMPLETED` (inmutables); `reserve`, `fail` y el
+  barrido de expiración invalidan la caché. El TTL de caché ≤ TTL de idempotencia.
+
+## Comportamiento ante fallos transitorios
+
+| Escenario | Respuesta | Recuperación |
+|---|---|---|
+| Buró de riesgo no responde en > 2 s (timeout) | Circuit breaker cerrado: la cadena falla → el registro queda `FAILED`/liberado → **503**. Circuit breaker abierto: fallback con score 50 (modo degradado). | La clave queda elegible a reintento; el CB transita a half-open tras `waitDurationInOpenState`. |
+| Core bancario 5xx / timeout | Fallo transitorio → `FAILED`/liberación → **503**. Fallback `DECLINED` si el CB está abierto. | Reintentable. |
+| Pool de BD agotado / fallo JDBC | `connection-timeout` (3 s) → fallo rápido; si falla `find`, no se ejecuta la cadena (idempotencia preservada). | Reintento del cliente; D5 reduce la probabilidad de agotamiento. |
+| Bulkhead lleno (25 llamadas en vuelo por servicio) | `BulkheadFullException` → **503** sin bloquear el hilo. | Rechazo inmediato; el cliente reintenta. |
+
+El mapeo error → HTTP está centralizado en `GlobalExceptionHandler`: canal inválido → 400,
+duplicado `IN_PROGRESS` → 409, timeout/bulkhead → 503, cualquier otro → 500 (sin exponer detalles
+internos).
+
+## Comandos de prueba (Maven)
+
+La estrategia de pruebas tiene tres tipos. Todos corren sobre el build Maven existente
+(`spring-boot-starter-parent`, Surefire con BlockHound habilitado). Si el proyecto tiene Maven
+Wrapper, sustituye `mvn` por `./mvnw` (Linux/macOS) o `.\mvnw.cmd` (Windows).
+
+```bash
+# 1) Pruebas unitarias / de ejemplo (Mockito + Reactor StepVerifier)
+#    Orquestador, cadena de procesamiento, decorator de caché, propiedades de timeout, etc.
+mvn test
+
+# 2) Pruebas de propiedad (jqwik, >= 100 iteraciones)
+#    Exactamente-una-ejecución, determinismo de duplicados, coherencia de caché,
+#    mapeo HTTP invariante, timeout del buró > 2s, no bloqueo del event-loop, liberación transitoria.
+mvn test -Dtest=*PropertyTest
+
+# 3) Pruebas de integración (Testcontainers PostgreSQL; requieren Docker)
+#    Durabilidad, restricción de esquema, carga/concurrencia (>= 16), resiliencia ante fallos.
+#    Sin Docker se SALTAN automáticamente (estado SKIPPED, el build sigue pasando).
+mvn test -Dtest=*IT,*DurabilityTest,*ConstraintTest,*LoadTest,*ResilienceTest,*NonBlocking*Test
+
+# Build completo con toda la suite
+mvn clean test
+```
+
+---
+
 *Reto generado automaticamente por Challenge Generator - Pragma*

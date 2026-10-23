@@ -2,8 +2,10 @@ package com.pragma.payments.infrastructure.adapters.out.risk;
 
 import com.pragma.payments.application.ports.out.RiskBureauPort;
 import com.pragma.payments.domain.model.Transaction;
+import com.pragma.payments.infrastructure.config.ExternalTimeoutProperties;
 import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.reactor.bulkhead.operator.BulkheadOperator;
 import io.github.resilience4j.retry.annotation.Retry;
@@ -18,27 +20,47 @@ import reactor.core.publisher.Mono;
 import java.time.Duration;
 import java.util.concurrent.TimeoutException;
 
+/**
+ * Adaptador de salida hacia el buró de riesgo (Fase 3, H2/H9, D2/D6).
+ *
+ * <p>Las políticas de resiliencia (Circuit Breaker y Retry de Resilience4j) se declaran sobre los
+ * métodos <b>públicos</b> del bean ({@link #getRiskScore(Transaction)} y
+ * {@link #isAccountBlacklisted(String)}), que son invocados a través del límite del bean. De este
+ * modo el proxy AOP de Spring/Resilience4j <b>sí intercepta</b> las anotaciones (corrige H2: las
+ * anotaciones ya no viven sobre métodos privados ni auto-invocados).</p>
+ *
+ * <p>El timeout del buró se aplica desde {@link ExternalTimeoutProperties#getRisk()} (único lugar
+ * de verdad, D2), que el reto exige estrictamente mayor que 2 segundos (por defecto 2500ms).</p>
+ *
+ * <p><b>Distinción fallback vs. fallo transitorio (Requirements 2.5, 2.6):</b> el método de
+ * fallback solo produce el resultado degradado (score 50) cuando el Circuit Breaker está
+ * <b>abierto</b> (señal {@link CallNotPermittedException}). Ante cualquier fallo transitorio con el
+ * Circuit Breaker <b>cerrado</b> (incluido un timeout superior a 2500ms, un error 5xx o un bulkhead
+ * lleno), el fallback <b>re-propaga</b> el error sin devolver el resultado degradado, de modo que
+ * la clave de idempotencia quede elegible para un reintento posterior.</p>
+ */
 @Component
 public class RiskBureauAdapter implements RiskBureauPort {
 
     private static final Logger log = LoggerFactory.getLogger(RiskBureauAdapter.class);
-    // Timeout alineado a 2000 ms: el buró de riesgos no debe retener la llamada más de 2s
-    // (Requirement 5.1). Supera ese umbral ⇒ timeout + liberación del permiso del bulkhead.
-    private static final int DEFAULT_TIMEOUT_SECONDS = 2;
+
+    /** Score de riesgo por defecto devuelto en modo degradado cuando el CB está abierto. */
+    private static final int FALLBACK_RISK_SCORE = 50;
 
     private final WebClient webClient;
     private final String baseUrl;
-    private final int timeoutSeconds;
+    private final Duration riskTimeout;
     private final Bulkhead bulkhead;
 
     public RiskBureauAdapter(
             WebClient webClient,
             BulkheadRegistry bulkheadRegistry,
-            @Value("${external.services.risk-bureau.url:http://localhost:8083}") String baseUrl,
-            @Value("${external.services.risk-bureau.timeout-seconds:2}") int timeoutSeconds) {
+            ExternalTimeoutProperties timeoutProperties,
+            @Value("${external.services.risk-bureau.url:http://localhost:8083}") String baseUrl) {
         this.webClient = webClient;
         this.baseUrl = baseUrl;
-        this.timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : DEFAULT_TIMEOUT_SECONDS;
+        // Único lugar de verdad del timeout de riesgo (D2): externalizado y > 2s por invariante.
+        this.riskTimeout = timeoutProperties.getRisk();
         this.bulkhead = bulkheadRegistry.bulkhead("riskBureauService");
     }
 
@@ -46,7 +68,7 @@ public class RiskBureauAdapter implements RiskBureauPort {
     @CircuitBreaker(name = "riskBureauCircuitBreaker", fallbackMethod = "getRiskScoreFallback")
     @Retry(name = "riskBureauRetry")
     public Mono<Integer> getRiskScore(Transaction transaction) {
-        log.info("Consultando risk score para cuenta: {}, monto: {}", 
+        log.info("Consultando risk score para cuenta: {}, monto: {}",
                 transaction.getAccountId(), transaction.getAmount());
 
         return webClient
@@ -55,17 +77,17 @@ public class RiskBureauAdapter implements RiskBureauPort {
                 .bodyValue(buildRiskRequest(transaction))
                 .retrieve()
                 .bodyToMono(RiskScoreResponse.class)
-                .timeout(Duration.ofSeconds(timeoutSeconds))
+                .timeout(riskTimeout)
                 .transformDeferred(BulkheadOperator.of(bulkhead))
                 .map(RiskScoreResponse::getScore)
-                .doOnSuccess(score -> log.info("Risk score obtenido: {} para cuenta: {}", 
+                .doOnSuccess(score -> log.info("Risk score obtenido: {} para cuenta: {}",
                         score, transaction.getAccountId()))
-                .doOnError(WebClientResponseException.class, e -> 
-                        log.error("Error HTTP {} al consultar risk bureau: {}", 
+                .doOnError(WebClientResponseException.class, e ->
+                        log.error("Error HTTP {} al consultar risk bureau: {}",
                                 e.getStatusCode().value(), e.getMessage()))
-                .doOnError(TimeoutException.class, e -> 
-                        log.error("Timeout al consultar risk bureau para cuenta: {}", 
-                                transaction.getAccountId()));
+                .doOnError(TimeoutException.class, e ->
+                        log.error("Timeout (> {}ms) al consultar risk bureau para cuenta: {}",
+                                riskTimeout.toMillis(), transaction.getAccountId()));
     }
 
     @Override
@@ -79,12 +101,12 @@ public class RiskBureauAdapter implements RiskBureauPort {
                 .uri(baseUrl + "/api/v1/risk/blacklist/{accountId}", accountId)
                 .retrieve()
                 .bodyToMono(BlacklistResponse.class)
-                .timeout(Duration.ofSeconds(timeoutSeconds))
+                .timeout(riskTimeout)
                 .transformDeferred(BulkheadOperator.of(bulkhead))
                 .map(BlacklistResponse::isBlacklisted)
                 .doOnSuccess(result -> log.info("Cuenta {} en blacklist: {}", accountId, result))
-                .doOnError(WebClientResponseException.class, e -> 
-                        log.error("Error HTTP {} al verificar blacklist: {}", 
+                .doOnError(WebClientResponseException.class, e ->
+                        log.error("Error HTTP {} al verificar blacklist: {}",
                                 e.getStatusCode().value(), e.getMessage()));
     }
 
@@ -97,16 +119,40 @@ public class RiskBureauAdapter implements RiskBureauPort {
         );
     }
 
-    private Mono<Integer> getRiskScoreFallback(Transaction transaction, Throwable t) {
-        log.warn("Fallback ejecutado para getRiskScore. Cuenta: {}, Error: {}", 
+    /**
+     * Fallback de {@link #getRiskScore(Transaction)}.
+     *
+     * <p>Solo degrada a {@link #FALLBACK_RISK_SCORE} cuando el Circuit Breaker está abierto
+     * ({@link CallNotPermittedException}); ante cualquier otro fallo (transitorio, CB cerrado)
+     * re-propaga el error para que la clave quede elegible a reintento (Requirements 2.5, 2.6).</p>
+     */
+    Mono<Integer> getRiskScoreFallback(Transaction transaction, Throwable t) {
+        if (t instanceof CallNotPermittedException) {
+            log.warn("Circuit breaker ABIERTO para getRiskScore. Cuenta: {}, aplicando score por defecto {}",
+                    transaction.getAccountId(), FALLBACK_RISK_SCORE);
+            return Mono.just(FALLBACK_RISK_SCORE);
+        }
+        log.error("Fallo transitorio en getRiskScore con circuit breaker cerrado. Cuenta: {}, Error: {}. "
+                        + "Se propaga sin fallback (clave elegible a reintento).",
                 transaction.getAccountId(), t.getMessage());
-        return Mono.just(50);
+        return Mono.error(t);
     }
 
-    private Mono<Boolean> isAccountBlacklistedFallback(String accountId, Throwable t) {
-        log.warn("Fallback ejecutado para isAccountBlacklisted. Cuenta: {}, Error: {}", 
-                accountId, t.getMessage());
-        return Mono.just(false);
+    /**
+     * Fallback de {@link #isAccountBlacklisted(String)}.
+     *
+     * <p>Solo degrada a {@code false} cuando el Circuit Breaker está abierto; ante un fallo
+     * transitorio con el Circuit Breaker cerrado re-propaga el error (Requirements 2.5, 2.6).</p>
+     */
+    Mono<Boolean> isAccountBlacklistedFallback(String accountId, Throwable t) {
+        if (t instanceof CallNotPermittedException) {
+            log.warn("Circuit breaker ABIERTO para isAccountBlacklisted. Cuenta: {}, degradando a false",
+                    accountId);
+            return Mono.just(false);
+        }
+        log.error("Fallo transitorio en isAccountBlacklisted con circuit breaker cerrado. Cuenta: {}, "
+                        + "Error: {}. Se propaga sin fallback.", accountId, t.getMessage());
+        return Mono.error(t);
     }
 
     private static class RiskRequest {
@@ -115,7 +161,7 @@ public class RiskBureauAdapter implements RiskBureauPort {
         private final String currency;
         private final String channel;
 
-        public RiskRequest(String accountId, java.math.BigDecimal amount, 
+        public RiskRequest(String accountId, java.math.BigDecimal amount,
                           String currency, String channel) {
             this.accountId = accountId;
             this.amount = amount;

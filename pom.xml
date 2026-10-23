@@ -61,6 +61,20 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
+        <!--
+            Caché (Fase 3, D3/D4): spring-boot-starter-cache habilita la abstracción de
+            caché de Spring y Caffeine es el proveedor acotado y de alto rendimiento usado
+            tanto para la caché de lectura de idempotencia (CachingIdempotencyStore) como
+            para la caché determinista de fraude (FraudDetectionAdapter).
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
         <dependency>
             <groupId>io.github.resilience4j</groupId>
             <artifactId>resilience4j-spring-boot3</artifactId>
@@ -148,15 +162,14 @@
                     <source>21</source>
                     <target>21</target>
                     <!--
-                        Fase 1: los tests del scaffold base (adapters/out y usecases) vienen
-                        desalineados/corruptos del generador del reto y no compilan. Se excluyen
-                        de la compilación de test para poder ejecutar los tests de la Fase 1.
-                        Se re-habilitarán al alinearlos en fases posteriores.
+                        Fase 3 (tarea 7.2): los tests del paquete usecases que quedaron acoplados al
+                        diseño anterior de PaymentUseCase (constructor de 5 argumentos con cadena
+                        externa y acceso directo al store) se eliminaron por duplicación; su cobertura
+                        vive ahora en los tests de IdempotencyOrchestrator (paquete orchestrator) y de
+                        PaymentProcessingChain (paquete chain). PaymentUseCaseTest se realineó al
+                        coordinador delgado y se compila/ejecuta con el resto de la suite, por lo que
+                        ya no se requiere ninguna exclusión de test-compile.
                     -->
-                    <testExcludes>
-                        <testExclude>**/adapters/out/**/*Test.java</testExclude>
-                        <testExclude>**/usecases/PaymentUseCaseTest.java</testExclude>
-                    </testExcludes>
                 </configuration>
             </plugin>
             <!--
